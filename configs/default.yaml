@@ -1,0 +1,40 @@
+mode: paper
+
+symbols:
+  - BTC
+  - ETH
+  - SOL
+
+markets:
+  timeframes:
+    - 5m
+    - 15m
+  min_seconds_remaining_entry: 45
+  min_seconds_remaining_flip: 45
+  no_new_entries_under_seconds: 30
+
+risk:
+  bankroll_usd: 1000
+  max_position_pct: 0.02
+  max_open_positions: 3
+  max_daily_loss_pct: 0.05
+  max_spread: 0.04
+  max_slippage: 0.03
+
+odds:
+  base_required_edge: 0.05
+  high_vol_required_edge: 0.08
+  late_market_required_edge: 0.10
+  min_probability: 0.58
+  min_confidence: 0.60
+
+paper:
+  slippage: 0.01
+
+execution:
+  passive_order_ttl_seconds: 20
+  default_order_type: FAK
+
+logging:
+  level: INFO
+  json_logs: true

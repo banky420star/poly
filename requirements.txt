@@ -1,0 +1,10 @@
+py-clob-client-v2
+python-dotenv
+PyYAML
+websockets
+aiohttp
+pydantic
+numpy
+pandas
+aiosqlite
+pytest
