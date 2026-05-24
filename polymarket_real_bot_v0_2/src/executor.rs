@@ -118,7 +118,7 @@ impl LiveExecutor {
 
         // Convert USDC notional to shares: shares = notional / price
         // CLOB requires max 2 decimal places for size
-        let shares = (notional / quote.price).round_dp(2);
+        let shares = (notional / quote.price).round_dp(6);
 
         // Shares must meet CLOB minimum (5)
         if shares < MIN_CLOB_SHARES {
