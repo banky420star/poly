@@ -1,8 +1,8 @@
-import asyncio
 import json
 import threading
 import time
 from collections import deque
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -48,7 +48,12 @@ EVENT_TO_STAGE = {
     "exit_check": "EXIT_FLIP",
     "paper_exit": "EXIT_FLIP",
     "closed_trade": "EXIT_FLIP",
+    "loop_state": "RECORDER",
 }
+
+# TTL thresholds for stage status
+ACTIVE_TTL_SEC = 2.0
+RECENT_TTL_SEC = 10.0
 
 
 # Shared state between WS thread and render loop
@@ -56,9 +61,11 @@ _events: deque = deque(maxlen=1000)
 _ws_connected = False
 _lock = threading.Lock()
 
+# Track per-stage last-seen timestamps
+_stage_ts: dict[str, datetime] = {}
+
 
 def _ws_reader():
-    """Background thread: connect to bot WebSocket, push events into deque."""
     global _ws_connected
     try:
         from websockets.sync.client import connect as ws_connect
@@ -84,7 +91,6 @@ def _ws_reader():
 
 
 def _file_reader() -> list[dict]:
-    """Fallback: read events from JSONL log file."""
     if not LOG_PATH.exists():
         return []
     try:
@@ -101,11 +107,9 @@ def _file_reader() -> list[dict]:
 
 
 def read_events() -> tuple[list[dict], bool]:
-    """Get current events from WebSocket (live) or file (fallback)."""
     with _lock:
         if _events:
             return list(_events), _ws_connected
-    # Fallback to file
     return _file_reader(), False
 
 
@@ -136,6 +140,20 @@ def pct(value: Any) -> str:
         return "-"
 
 
+def _now() -> datetime:
+    return datetime.now(timezone.utc)
+
+
+def _parse_ts(ts_str: str | None) -> datetime | None:
+    if not ts_str:
+        return None
+    try:
+        s = ts_str.replace("Z", "+00:00")
+        return datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
 def latest_market(events: list[dict]) -> dict:
     markets: dict[str, dict] = {}
 
@@ -149,6 +167,7 @@ def latest_market(events: list[dict]) -> dict:
             {
                 "market_id": market_id,
                 "market": market_id,
+                "symbol": None,
                 "spot": None,
                 "price_to_beat": None,
                 "distance_to_target": None,
@@ -187,34 +206,81 @@ def latest_market(events: list[dict]) -> dict:
     )[0]
 
 
-def infer_stage_status(events: list[dict]) -> dict[str, str]:
-    status = {stage: "waiting" for stage, _ in PIPELINE_STAGES}
+def best_rejected(events: list[dict]) -> dict | None:
+    """Find the best market that was NOT traded (NO_TRADE decision)."""
+    best = None
+    best_edge = -999.0
 
-    for event in events[-80:]:
+    for event in events:
+        decision = event.get("decision", "")
+        edge = safe_float(event.get("adjusted_edge"), -999)
+        if decision == "NO_TRADE" and edge > best_edge:
+            # Check this is from a recent decision event
+            if event.get("event") == "decision":
+                best = event
+                best_edge = edge
+
+    return best
+
+
+def infer_stage_status(events: list[dict]) -> dict[str, tuple[str, str]]:
+    """TTL-based stage status. Returns {stage: (status, icon)}."""
+    now = _now()
+    stage_ages: dict[str, float] = {}
+
+    # Scan events to find latest timestamp per stage
+    for event in events:
         event_name = str(event.get("event", ""))
         stage = event.get("stage") or EVENT_TO_STAGE.get(event_name)
+        if not stage:
+            continue
+        ts = _parse_ts(event.get("ts"))
+        if ts:
+            age = (now - ts).total_seconds()
+            if stage not in stage_ages or age < stage_ages[stage]:
+                stage_ages[stage] = age
 
-        if stage in status:
-            status[stage] = "done"
-
-    if events:
-        latest_event = events[-1]
-        latest_name = str(latest_event.get("event", ""))
-        active_stage = latest_event.get("stage") or EVENT_TO_STAGE.get(latest_name)
-
-        if active_stage in status:
-            status[active_stage] = "active"
+    status: dict[str, tuple[str, str]] = {}
+    for stage_key, _label in PIPELINE_STAGES:
+        age = stage_ages.get(stage_key)
+        if age is None:
+            status[stage_key] = ("idle", "·")
+        elif age < ACTIVE_TTL_SEC:
+            status[stage_key] = ("active", "▶")
+        elif age < RECENT_TTL_SEC:
+            status[stage_key] = ("recent", "✓")
+        else:
+            status[stage_key] = ("idle", "·")
 
     return status
+
+
+def get_startup_state(events: list[dict]) -> dict:
+    """Extract feed/mode state from loop_state events."""
+    state = {
+        "loop": 0,
+        "mode": "paper",
+        "binance_ws": False,
+        "poly_ws": False,
+        "markets": 0,
+        "positions": 0,
+        "live_mode": False,
+    }
+    for e in events:
+        if e.get("event") == "loop_state":
+            for k in state:
+                if k in e:
+                    state[k] = e[k]
+    return state
 
 
 def make_header(events: list[dict], ws_ok: bool) -> Panel:
     last_ts = events[-1].get("ts", "-") if events else "-"
     title = Text("POLY ODDS BOT TUI", style="bold cyan")
-    conn = Text(" ⚡WS" if ws_ok else " 📄file", style="green" if ws_ok else "dim")
+    conn = Text(" WS" if ws_ok else " file", style="green" if ws_ok else "dim")
     subtitle = Text.assemble(
-        ("Live terminal cockpit | last update: ", "dim"),
-        (last_ts, "white"),
+        ("Live terminal cockpit | last: ", "dim"),
+        (last_ts[-15:], "white"),
         conn,
     )
 
@@ -231,20 +297,46 @@ def make_pipeline_panel(events: list[dict]) -> Panel:
 
     table = Table.grid(expand=True)
     table.add_column(ratio=1)
-    table.add_column(ratio=3)
+    table.add_column(ratio=2)
+    table.add_column(ratio=1, justify="right")
+
+    style_map = {
+        "active": "bold yellow",
+        "recent": "green",
+        "idle": "dim",
+    }
 
     for stage, label in PIPELINE_STAGES:
-        state = status.get(stage, "waiting")
-        if state == "active":
-            icon, style = "▶", "bold yellow"
-        elif state == "done":
-            icon, style = "✓", "green"
-        else:
-            icon, style = "·", "dim"
-
-        table.add_row(Text(f"{icon} {stage}", style=style), Text(label, style=style))
+        state, icon = status.get(stage, ("idle", "·"))
+        style = style_map.get(state, "dim")
+        state_label = state.upper() if state != "idle" else ""
+        table.add_row(
+            Text(f"{icon} {stage}", style=style),
+            Text(label, style=style),
+            Text(state_label, style=f"{style} italic"),
+        )
 
     return Panel(table, title="Pipeline Stages", border_style="blue")
+
+
+def make_startup_panel(events: list[dict]) -> Panel:
+    s = get_startup_state(events)
+
+    table = Table.grid(expand=True)
+    table.add_column(ratio=1)
+    table.add_column(ratio=1, justify="right")
+
+    binance_icon = "green" if s["binance_ws"] else "yellow"
+    poly_icon = "green" if s["poly_ws"] else "yellow"
+    mode_icon = "red bold" if s["live_mode"] else "green"
+
+    table.add_row(Text("Binance WS", style="dim"), Text("connected" if s["binance_ws"] else "warming up", style=binance_icon))
+    table.add_row(Text("Poly WS", style="dim"), Text("connected" if s["poly_ws"] else "warming up", style=poly_icon))
+    table.add_row(Text("Markets", style="dim"), Text(str(s["markets"]), style="white"))
+    table.add_row(Text("Positions", style="dim"), Text(str(s["positions"]), style="white"))
+    table.add_row(Text("Mode", style="dim"), Text("LIVE" if s["live_mode"] else "PAPER", style=mode_icon))
+
+    return Panel(table, title="Startup Status", border_style="yellow")
 
 
 def make_market_panel(market: dict) -> Panel:
@@ -263,15 +355,13 @@ def make_market_panel(market: dict) -> Panel:
     edge_style = "green" if edge >= 0 else "red"
 
     rows = [
-        ("Market", market.get("market", market.get("market_id"))),
+        ("Market", market.get("market", market.get("market_id"))[:50]),
         ("Symbol", market.get("symbol", "-")),
         ("Spot", fmt(market.get("spot"), 2)),
         ("Price to beat", fmt(market.get("price_to_beat"), 2)),
-        ("Distance", fmt(market.get("distance_to_target"), 2)),
         ("Seconds left", fmt(market.get("seconds_remaining"), 0)),
         ("Best side", market.get("best_side", "-")),
         ("Market ask", fmt(market.get("market_ask"), 3)),
-        ("Max entry", fmt(market.get("max_entry_price"), 3)),
         ("Adjusted edge", pct(market.get("adjusted_edge"))),
         ("Decision", market.get("decision", "-")),
     ]
@@ -331,6 +421,38 @@ def make_probability_panel(market: dict) -> Panel:
     return Panel(grid, title="Probability Engine", border_style="magenta")
 
 
+def make_no_edge_panel(rejected: dict | None) -> Panel:
+    if not rejected:
+        return Panel(
+            Text("", style="dim"),
+            title="Best Rejected Setup",
+            border_style="dim",
+        )
+
+    fair_up = safe_float(rejected.get("prob_up"), 0.5)
+    ask = safe_float(rejected.get("market_ask"), 0.5)
+    edge = safe_float(rejected.get("adjusted_edge"), 0)
+
+    rows = [
+        ("Market", str(rejected.get("market_id", "-"))[:40]),
+        ("Symbol", str(rejected.get("symbol", "-"))),
+        ("Side", str(rejected.get("best_side", "-"))),
+        ("Fair", f"{fair_up:.3f}"),
+        ("Ask", f"{ask:.3f}"),
+        ("Edge", f"{edge:+.4f}"),
+    ]
+
+    table = Table.grid(expand=True)
+    table.add_column(ratio=1)
+    table.add_column(justify="right", ratio=1)
+
+    for label, value in rows:
+        style = "red" if label == "Edge" and edge < 0 else "white"
+        table.add_row(Text(label, style="dim"), Text(value, style=style))
+
+    return Panel(table, title="Best Rejected Setup", border_style="red")
+
+
 def make_position_panel(market: dict) -> Panel:
     if not market or not market.get("position_side"):
         return Panel(
@@ -364,7 +486,7 @@ def make_events_panel(events: list[dict]) -> Panel:
             reason = ", ".join(str(x) for x in reason)
 
         table.add_row(
-            str(event.get("ts", "-"))[-18:],
+            str(event.get("ts", "-"))[-15:],
             str(event.get("event", "-")),
             str(event.get("market_id", "-")),
             str(event.get("decision") or event.get("action") or event.get("status") or "-"),
@@ -376,37 +498,51 @@ def make_events_panel(events: list[dict]) -> Panel:
 
 def build_layout(events: list[dict], ws_ok: bool) -> Layout:
     market = latest_market(events)
+    rejected = best_rejected(events)
 
     layout = Layout()
     layout.split_column(
-        Layout(name="header", size=5),
-        Layout(name="body", ratio=4),
+        Layout(name="header", size=4),
+        Layout(name="body", ratio=5),
         Layout(name="bottom", ratio=3),
     )
 
     layout["body"].split_row(
         Layout(name="left", ratio=1),
+        Layout(name="mid", ratio=1),
         Layout(name="right", ratio=2),
     )
 
-    layout["right"].split_column(
-        Layout(name="market", ratio=2),
-        Layout(name="probability", ratio=1),
-        Layout(name="position", ratio=1),
+    layout["left"].split_column(
+        Layout(name="pipeline", ratio=3),
+        Layout(name="startup", ratio=2),
     )
 
+    layout["mid"].split_column(
+        Layout(name="probability"),
+        Layout(name="position"),
+    )
+
+    layout["right"].split_column(
+        Layout(name="market"),
+        Layout(name="lower_right"),
+    )
+
+    no_trade = not market or not market.get("decision") or market.get("decision") == "NO_TRADE"
+
     layout["header"].update(make_header(events, ws_ok))
-    layout["left"].update(make_pipeline_panel(events))
+    layout["pipeline"].update(make_pipeline_panel(events))
+    layout["startup"].update(make_startup_panel(events))
     layout["market"].update(make_market_panel(market))
     layout["probability"].update(make_probability_panel(market))
     layout["position"].update(make_position_panel(market))
+    layout["lower_right"].update(make_no_edge_panel(rejected) if no_trade else make_position_panel(market))
     layout["bottom"].update(make_events_panel(events))
 
     return layout
 
 
 def main():
-    # Start WebSocket reader thread
     ws_thread = threading.Thread(target=_ws_reader, daemon=True)
     ws_thread.start()
 

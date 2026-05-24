@@ -244,6 +244,18 @@ async def run_loop(
                 recorder.write("paper_flip_entry", result)
                 logger.info("FLIP ENTRY: %s %s @ %.4f", market.symbol, flip_decision.side, flip_decision.limit_price)
 
+    # 6. Publish canonical loop state for TUI
+    recorder.write("loop_state", {
+        "stage": "RECORDER",
+        "loop": loop_num,
+        "mode": cfg.mode,
+        "binance_ws": binance_feed.running if hasattr(binance_feed, 'running') else False,
+        "poly_ws": poly_ws.connected,
+        "markets": len(markets),
+        "positions": len(positions.positions),
+        "live_mode": cfg.mode == "live",
+    })
+
 
 async def run():
     global logger, running
