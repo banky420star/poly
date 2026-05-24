@@ -1,18 +1,25 @@
 mod arb;
+mod calibration;
 mod clob;
 mod config;
+mod edge;
 mod executor;
 mod exit;
+mod features;
 mod feed;
+mod fees;
 mod gamma;
 mod live;
 mod models;
+mod order_registry;
 mod paper;
 mod poly_ws;
+mod probability;
 mod risk;
 mod selector;
 mod signing;
 mod strategy;
+mod telemetry;
 
 use std::io::Write;
 
@@ -131,6 +138,7 @@ fn print_dashboard(
     equity: rust_decimal::Decimal,
     depth_filtered: usize,
     live: bool,
+    depth_summaries: &[models::MarketDepthSummary],
 ) {
     let cash = ledger.cash_usdc;
     let starting = ledger.starting_cash_usdc;
@@ -205,6 +213,40 @@ fn print_dashboard(
                 avg_price,
                 fmt_usdc(pos.cost_usdc),
             );
+        }
+        println!();
+    }
+
+    if !depth_summaries.is_empty() {
+        println!("  {BOLD}╔══════════════════════════════════════════════════════════════════════════════╗{RESET}");
+        println!("  {BOLD}║          MARKET DEPTH & SIGNALS                                             ║{RESET}");
+        println!("  {BOLD}╚══════════════════════════════════════════════════════════════════════════════╝{RESET}");
+        for ds in depth_summaries.iter().take(8) {
+            let spread_str = ds.spread_bps.map_or("???".to_string(), |s| format!("{}bps", s));
+            let spread_color = ds.spread_bps.map_or(DIM, |s| if s < 300 { GREEN } else if s < 600 { YELLOW } else { RED });
+            let skew_color = if ds.combined_skew.abs() > 2.8 { GREEN } else if ds.combined_skew.abs() > 1.5 { YELLOW } else { DIM };
+            let depth_label = if ds.depth_ok { format!("{GREEN}OK{RESET}") } else { format!("{RED}THIN{RESET}") };
+            let skew_label = if ds.combined_skew > 0.0 {
+                format!("{GREEN}+{:.1}{RESET}", ds.combined_skew)
+            } else if ds.combined_skew < 0.0 {
+                format!("{RED}{:.1}{RESET}", ds.combined_skew)
+            } else {
+                format!("{DIM}0.0{RESET}")
+            };
+            let short_q: String = ds.question.chars().take(48).collect();
+            println!(
+                "  {CYAN}{:<48}{RESET}  mid={BOLD}${:.2}{RESET}  spread={spread_color}{}{RESET}  depth={}",
+                short_q, ds.yes_mid, spread_str, depth_label,
+            );
+            println!(
+                "  {DIM}  YES bid=${:.0} ask=${:.0}  NO bid=${:.0} ask=${:.0}  skew={}{RESET}",
+                ds.yes_bid_depth, ds.yes_ask_depth,
+                ds.no_bid_depth, ds.no_ask_depth,
+                skew_label,
+            );
+        }
+        if depth_summaries.len() > 8 {
+            println!("  {DIM}  ... and {} more markets{RESET}", depth_summaries.len() - 8);
         }
         println!();
     }
@@ -401,6 +443,7 @@ async fn run_bot(config_path: &str, paper: bool, live: bool) -> Result<()> {
             std::collections::HashMap::new();
         let mut best_asks: std::collections::HashMap<String, rust_decimal::Decimal> =
             std::collections::HashMap::new();
+        let mut depth_summaries: Vec<models::MarketDepthSummary> = Vec::new();
 
         for market in selected.iter() {
             let cid = market.condition_id.clone().unwrap_or_else(|| "unknown".to_string());
@@ -451,6 +494,35 @@ async fn run_bot(config_path: &str, paper: bool, live: bool) -> Result<()> {
             let time_left = strategy::time_left_seconds(market);
             if time_left.map_or(true, |t| t < 30) {
                 continue;
+            }
+
+            // Build depth summary for dashboard display
+            if let Some(ref d) = depth {
+                let yes_mid_val = market.yes_mid().unwrap_or(dec!(0.5));
+                let spread_bps = d.yes_best_bid.and_then(|bid| {
+                    d.yes_best_ask.map(|ask| {
+                        if ask.is_zero() { return 0i64; }
+                        let spread = ask - bid;
+                        ((spread / ask) * rust_decimal::Decimal::from(10000)).to_i64().unwrap_or(0)
+                    })
+                });
+                let total_depth = d.yes_ask_depth_usdc + d.no_ask_depth_usdc;
+                let combined_skew = strategy::compute_combined_skew(
+                    momentum_signal, yes_mid_val,
+                    d.yes_bid_depth_usdc, d.no_bid_depth_usdc,
+                    cfg.strategy.momentum_weight, cfg.strategy.imbalance_weight,
+                );
+                depth_summaries.push(models::MarketDepthSummary {
+                    question: market.question.clone(),
+                    yes_mid: yes_mid_val,
+                    spread_bps,
+                    yes_bid_depth: d.yes_bid_depth_usdc,
+                    yes_ask_depth: d.yes_ask_depth_usdc,
+                    no_bid_depth: d.no_bid_depth_usdc,
+                    no_ask_depth: d.no_ask_depth_usdc,
+                    combined_skew,
+                    depth_ok: total_depth >= min_depth,
+                });
             }
 
             // Depth filter: skip markets with insufficient liquidity on the side we'd trade.
@@ -554,13 +626,13 @@ async fn run_bot(config_path: &str, paper: bool, live: bool) -> Result<()> {
                                     if result.filled {
                                         tracing::info!(
                                             order_id = %result.order_id,
-                                            filled = %result.size_matched,
+                                            filled = %result.shares_filled,
                                             "live order filled"
                                         );
                                         let event = ledger.submit_quote_intent(&cfg.paper, quote.clone())?;
                                         if event.side == "BUY" { buys += 1; } else { sells += 1; }
                                         // Log live fill to file
-                                        log_live_fill(&result.order_id, &quote, &result.size_matched);
+                                        log_live_fill(&result.order_id, &quote, &result.shares_filled);
                                     } else {
                                         tracing::debug!(
                                             order_id = %result.order_id,
@@ -653,27 +725,29 @@ async fn run_bot(config_path: &str, paper: bool, live: bool) -> Result<()> {
         // Live balance already fetched above for compounding, just keep it for dashboard
         // and logging. The equity calculation and compounding were already done before
         // quotes were generated (above).
-        if live {
-            if let Some(exec) = &live_executor {
-                write_live_dashboard(
-                    iteration, live_balance, &ledger, equity,
-                    buys, sells, rejected, exec.orders_placed, exec.orders_failed,
-                    selected_count, markets.len(),
-                    ref_price.to_f64().unwrap_or(0.0),
-                    pct_change.to_f64().unwrap_or(0.0),
-                    momentum_signal.to_f64().unwrap_or(0.0),
-                    depth_filtered,
-                    &cfg,
-                    &selected,
-                );
-            }
-        }
+        let (orders_placed, orders_failed) = if let Some(exec) = &live_executor {
+            (exec.orders_placed, exec.orders_failed)
+        } else {
+            (0, 0)
+        };
+        write_live_dashboard(
+            iteration, live_balance, &ledger, equity,
+            buys, sells, rejected, orders_placed, orders_failed,
+            selected_count, markets.len(),
+            ref_price.to_f64().unwrap_or(0.0),
+            pct_change.to_f64().unwrap_or(0.0),
+            momentum_signal.to_f64().unwrap_or(0.0),
+            depth_filtered,
+            &cfg,
+            &selected,
+        );
 
         print_dashboard(
             iteration, ref_price, pct_change, momentum_signal,
             selected_count, markets.len(),
             buys, sells, rejected, &ledger, equity, depth_filtered,
             live,
+            &depth_summaries,
         );
 
         if cfg.dry_run_iterations > 0 && iteration >= cfg.dry_run_iterations {

@@ -50,6 +50,19 @@ pub struct WsBestBidAsk {
     pub best_ask: Option<String>,
 }
 
+#[derive(Debug, Clone, Deserialize)]
+pub struct WsLastTradePriceEvent {
+    #[serde(rename = "asset_id")]
+    pub asset_id: String,
+    pub price: String,
+    #[serde(default)]
+    pub size: Option<String>,
+    #[serde(default)]
+    pub side: Option<String>,
+    #[serde(default)]
+    pub timestamp: Option<String>,
+}
+
 #[derive(Debug, Clone)]
 pub struct MarketSnapshot {
     pub asset_id: String,
@@ -57,6 +70,7 @@ pub struct MarketSnapshot {
     pub best_ask: Option<rust_decimal::Decimal>,
     pub mid_price: Option<rust_decimal::Decimal>,
     pub last_trade_price: Option<rust_decimal::Decimal>,
+    pub resolved: Option<bool>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -84,6 +98,7 @@ impl MarketBookCache {
             .as_ref()
             .and_then(|p| Decimal::from_str(p).ok());
 
+        let existing = self.books.remove(&event.asset_id);
         self.books.insert(
             event.asset_id.clone(),
             MarketSnapshot {
@@ -92,6 +107,7 @@ impl MarketBookCache {
                 best_ask,
                 mid_price,
                 last_trade_price,
+                resolved: existing.and_then(|s| s.resolved),
             },
         );
     }
@@ -109,6 +125,7 @@ impl MarketBookCache {
                 best_ask: None,
                 mid_price: None,
                 last_trade_price: None,
+                resolved: None,
             });
 
         if let Ok(price) = Decimal::from_str(&event.price) {
@@ -139,6 +156,7 @@ impl MarketBookCache {
                 best_ask: None,
                 mid_price: None,
                 last_trade_price: None,
+                resolved: None,
             });
 
         entry.best_bid = event.best_bid.as_ref().and_then(|p| Decimal::from_str(p).ok());
@@ -147,6 +165,35 @@ impl MarketBookCache {
             (Some(bid), Some(ask)) => Some((bid + ask) / Decimal::TWO),
             _ => None,
         };
+    }
+
+    pub fn update_last_trade_price(&mut self, event: &WsLastTradePriceEvent) {
+        use rust_decimal::prelude::FromStr;
+        use rust_decimal::Decimal;
+
+        if let Ok(price) = Decimal::from_str(&event.price) {
+            let entry = self.books.entry(event.asset_id.clone()).or_insert(MarketSnapshot {
+                asset_id: event.asset_id.clone(),
+                best_bid: None,
+                best_ask: None,
+                mid_price: None,
+                last_trade_price: None,
+                resolved: None,
+            });
+            entry.last_trade_price = Some(price);
+            // Update best bid/ask based on trade side
+            match event.side.as_deref() {
+                Some("BUY") => entry.best_ask = Some(price),
+                Some("SELL") => entry.best_bid = Some(price),
+                _ => {}
+            }
+        }
+    }
+
+    pub fn mark_resolved(&mut self, asset_id: &str) {
+        if let Some(entry) = self.books.get_mut(asset_id) {
+            entry.resolved = Some(true);
+        }
     }
 
     pub fn get(&self, asset_id: &str) -> Option<&MarketSnapshot> {
@@ -269,6 +316,31 @@ async fn run_ws_loop(
                             {
                                 debug!(asset_id = %bba_event.asset_id, "best bid/ask");
                                 cache.update_best_bid_ask(&bba_event);
+                            }
+                        }
+                        "last_trade_price" => {
+                            if let Ok(ltp_event) =
+                                serde_json::from_value::<WsLastTradePriceEvent>(event)
+                            {
+                                debug!(asset_id = %ltp_event.asset_id, price = %ltp_event.price, "last trade price");
+                                cache.update_last_trade_price(&ltp_event);
+                            }
+                        }
+                        "market_resolved" => {
+                            if let Some(asset_id) = event
+                                .get("asset_id")
+                                .and_then(|v| v.as_str())
+                            {
+                                info!(asset_id = %asset_id, "market resolved");
+                                cache.mark_resolved(asset_id);
+                            }
+                        }
+                        "new_market" => {
+                            if let Some(asset_id) = event
+                                .get("asset_id")
+                                .and_then(|v| v.as_str())
+                            {
+                                info!(asset_id = %asset_id, "new market created");
                             }
                         }
                         _ => {

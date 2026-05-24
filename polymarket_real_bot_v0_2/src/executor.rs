@@ -20,7 +20,8 @@ use hmac::Mac;
 pub struct OrderResult {
     pub order_id: String,
     pub filled: bool,
-    pub size_matched: Decimal,
+    /// Number of shares filled (not USDC notional).
+    pub shares_filled: Decimal,
 }
 
 /// The live executor. Handles L2 auth, order placement, and heartbeat.
@@ -98,40 +99,11 @@ impl LiveExecutor {
     /// Place a limit order and check whether it filled immediately.
     /// Returns OrderResult with fill status. The caller should only record
     /// a paper fill when `filled == true`.
+    /// size_usdc is USDC notional. Risk engine validates CLOB minimums before
+    /// this point, so we convert directly to shares and place the order.
     pub async fn execute_order(&mut self, quote: &QuoteIntent) -> Result<OrderResult> {
-        // CLOB enforces a minimum of 5 shares per order and $1 minimum notional
-        const MIN_CLOB_SHARES: Decimal = rust_decimal_macros::dec!(5);
-        const MIN_NOTIONAL_USDC: Decimal = rust_decimal_macros::dec!(1);
-
         let notional = quote.size_usdc.min(self.max_order_usdc);
-
-        // Notional must meet CLOB minimum ($1)
-        if notional < MIN_NOTIONAL_USDC {
-            debug!(
-                notional = %notional,
-                min = %MIN_NOTIONAL_USDC,
-                "ORDER SKIPPED → notional below CLOB minimum $1"
-            );
-            self.orders_failed += 1;
-            anyhow::bail!("notional ${} below CLOB minimum $1", notional);
-        }
-
-        // Convert USDC notional to shares: shares = notional / price
-        // CLOB requires max 2 decimal places for size
         let shares = (notional / quote.price).round_dp(6);
-
-        // Shares must meet CLOB minimum (5)
-        if shares < MIN_CLOB_SHARES {
-            debug!(
-                shares = %shares,
-                notional = %notional,
-                price = %quote.price,
-                min = %MIN_CLOB_SHARES,
-                "ORDER SKIPPED → shares below CLOB minimum 5"
-            );
-            self.orders_failed += 1;
-            anyhow::bail!("shares {} below CLOB minimum 5 (notional=${} @ ${})", shares, notional, quote.price);
-        }
 
         let side = if quote.side.to_uppercase() == "BUY" {
             Side::Buy
@@ -179,14 +151,14 @@ impl LiveExecutor {
                             Ok(OrderResult {
                                 order_id,
                                 filled: true,
-                                size_matched: filled_amount,
+                                shares_filled: filled_amount,
                             })
                         } else {
                             debug!(order_id = %order_id, "LIVE ORDER — resting on book (not yet filled)");
                             Ok(OrderResult {
                                 order_id,
                                 filled: false,
-                                size_matched: Decimal::ZERO,
+                                shares_filled: Decimal::ZERO,
                             })
                         }
                     }
@@ -196,7 +168,7 @@ impl LiveExecutor {
                         Ok(OrderResult {
                             order_id,
                             filled: false,
-                            size_matched: Decimal::ZERO,
+                            shares_filled: Decimal::ZERO,
                         })
                     }
                 }
@@ -216,8 +188,29 @@ impl LiveExecutor {
         Ok(matched)
     }
 
-    /// Send heartbeat to keep orders alive.
+    /// Cancel a single order by ID.
+    pub async fn cancel_order(&self, order_id: &str) -> Result<()> {
+        info!(order_id = %order_id, "cancelling order");
+        self.client.cancel_order(order_id).await?;
+        Ok(())
+    }
+
+    /// Send heartbeat to keep the auth session and WS connection alive.
     pub async fn send_heartbeat(&mut self) -> Result<()> {
+        let path = "/orders";
+        let headers = self.l2_headers("GET", path, "");
+        let url = format!("{}{}", self.clob_base_url, path);
+        let resp = self
+            .http
+            .get(&url)
+            .header("POLY_API_KEY", &headers[0].1)
+            .header("POLY_SIGNATURE", &headers[1].1)
+            .header("POLY_TIMESTAMP", &headers[2].1)
+            .header("POLY_PASSPHRASE", &headers[3].1)
+            .send()
+            .await?;
+        let status = resp.status();
+        debug!(status = %status, "heartbeat sent");
         Ok(())
     }
 

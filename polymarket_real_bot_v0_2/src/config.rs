@@ -13,6 +13,8 @@ pub struct AppConfig {
     pub risk: RiskConfig,
     pub strategy: StrategyConfig,
     pub fees: FeesConfig,
+    #[serde(default)]
+    pub execution: ExecutionConfig,
     pub market_filter: MarketFilterConfig,
     #[serde(default)]
     pub ai: Option<AiConfig>,
@@ -53,6 +55,23 @@ pub struct RiskConfig {
     pub max_open_intents: usize,
     #[serde(default = "default_max_daily_trades")]
     pub max_daily_trades: usize,
+    /// Live-mode safety gates
+    #[serde(default = "default_live_min_balance")]
+    pub live_min_balance_usdc: Decimal,
+    #[serde(default = "default_max_data_age_ms")]
+    pub max_data_age_ms: u64,
+    #[serde(default = "default_require_clean_build")]
+    pub require_clean_build_for_live: bool,
+}
+
+fn default_live_min_balance() -> Decimal {
+    Decimal::from(30)
+}
+fn default_max_data_age_ms() -> u64 {
+    4000
+}
+fn default_require_clean_build() -> bool {
+    true
 }
 
 fn default_max_daily_trades() -> usize {
@@ -89,20 +108,38 @@ pub struct StrategyConfig {
     /// Max USDC cap for directional load orders
     #[serde(default = "default_load_cap_usdc")]
     pub load_cap_usdc: Decimal,
+    /// Use order book imbalance in skew calculation
+    #[serde(default = "default_false")]
+    pub use_orderbook_imbalance: bool,
+    /// Weight of imbalance (0-1), remaining weight goes to momentum
+    #[serde(default = "default_imbalance_weight")]
+    pub imbalance_weight: f64,
+    /// Weight of momentum signal (0-1)
+    #[serde(default = "default_momentum_weight")]
+    pub momentum_weight: f64,
+    /// Minimum combined skew for trade entry
+    #[serde(default = "default_min_combined_skew")]
+    pub min_combined_skew: f64,
+    /// Minimum order book depth in USDC
+    #[serde(default = "default_min_depth_usdc")]
+    pub min_depth_usdc: Decimal,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct FeesConfig {
-    pub maker_fee_bps: i64,
-    pub taker_fee_bps: i64,
+    /// Polymarket maker fee rate: 0.0 (makers never charged)
+    pub maker_fee_rate: Decimal,
+    /// Polymarket crypto taker fee coefficient: 0.07
+    /// Fee formula: shares × rate × price × (1-price)
+    pub crypto_taker_fee_rate: Decimal,
     pub prefer_maker: bool,
 }
 
 impl Default for FeesConfig {
     fn default() -> Self {
         Self {
-            maker_fee_bps: 0,
-            taker_fee_bps: 80,
+            maker_fee_rate: Decimal::ZERO,
+            crypto_taker_fee_rate: rust_decimal_macros::dec!(0.07),
             prefer_maker: true,
         }
     }
@@ -120,7 +157,7 @@ pub struct MarketFilterConfig {
 }
 
 fn default_min_depth_usdc() -> Decimal {
-    Decimal::from(50)
+    Decimal::from(25_000)
 }
 
 fn default_take_profit_bps() -> i64 {
@@ -150,6 +187,11 @@ fn default_load_multiplier_base() -> Decimal {
 fn default_load_cap_usdc() -> Decimal {
     Decimal::from(100)
 }
+
+fn default_false() -> bool { false }
+fn default_imbalance_weight() -> f64 { 0.40 }
+fn default_momentum_weight() -> f64 { 0.60 }
+fn default_min_combined_skew() -> f64 { 2.8 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct AiConfig {
@@ -184,3 +226,36 @@ fn default_max_order_pct() -> f64 { 0.19 }
 fn default_max_exposure_pct() -> f64 { 0.50 }
 fn default_min_cash_buffer_pct() -> f64 { 0.30 }
 fn default_base_bet_pct() -> f64 { 0.05 }
+
+/// Execution-layer config for order lifecycle management.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ExecutionConfig {
+    #[serde(default = "default_true")]
+    pub maker_first: bool,
+    #[serde(default = "default_maker_ttl_ms")]
+    pub maker_ttl_ms: u64,
+    #[serde(default = "default_replace_drift_ticks")]
+    pub replace_if_drift_ticks: i64,
+    #[serde(default = "default_replace_age_ms")]
+    pub replace_if_age_ms: i64,
+    #[serde(default = "default_max_slippage_bps")]
+    pub max_slippage_bps: i64,
+}
+
+fn default_true() -> bool { true }
+fn default_maker_ttl_ms() -> u64 { 12000 }
+fn default_replace_drift_ticks() -> i64 { 2 }
+fn default_replace_age_ms() -> i64 { 9000 }
+fn default_max_slippage_bps() -> i64 { 80 }
+
+impl Default for ExecutionConfig {
+    fn default() -> Self {
+        Self {
+            maker_first: true,
+            maker_ttl_ms: 12000,
+            replace_if_drift_ticks: 2,
+            replace_if_age_ms: 9000,
+            max_slippage_bps: 80,
+        }
+    }
+}

@@ -93,15 +93,32 @@ impl ReactiveDirectional {
         let window_secs = self.cfg.directional_load_window_seconds;
         let in_load_window = time_left.map_or(false, |t| t <= window_secs);
 
-        let directional_skew = compute_skew(momentum_signal, yes_mid);
+        let directional_skew = if self.cfg.use_orderbook_imbalance {
+            compute_combined_skew(
+                momentum_signal,
+                yes_mid,
+                depth.map_or(Decimal::ZERO, |d| d.yes_bid_depth_usdc),
+                depth.map_or(Decimal::ZERO, |d| d.no_bid_depth_usdc),
+                self.cfg.momentum_weight,
+                self.cfg.imbalance_weight,
+            )
+        } else {
+            compute_skew(momentum_signal, yes_mid)
+        };
         let skew_strength = directional_skew.abs();
+
+        let min_skew = if self.cfg.use_orderbook_imbalance {
+            self.cfg.min_combined_skew
+        } else {
+            self.cfg.min_skew_ratio * 2.0
+        };
 
         // Dynamic position sizing: scale load size with skew confidence.
         // Multipliers and caps are configurable in config.toml [strategy].
         let base_size = ledger.default_order_size_usdc();
-        let load_size = if skew_strength >= self.cfg.min_skew_ratio * 2.0 {
+        let load_size = if skew_strength >= min_skew {
             (base_size * self.cfg.load_multiplier_strong).min(self.cfg.load_cap_usdc)
-        } else if skew_strength >= self.cfg.min_skew_ratio * 1.5 {
+        } else if skew_strength >= min_skew * 0.75 {
             (base_size * self.cfg.load_multiplier_medium).min(self.cfg.load_cap_usdc * dec!(0.8))
         } else {
             (base_size * self.cfg.load_multiplier_base).min(self.cfg.load_cap_usdc * dec!(0.6))
@@ -126,7 +143,18 @@ impl ReactiveDirectional {
         let effective_load_size = (load_size * depth_multiplier).round_dp(2);
         let effective_base_size = (base_size * depth_multiplier).round_dp(2);
 
-        if in_load_window && skew_strength >= self.cfg.min_skew_ratio && effective_load_size > Decimal::ZERO {
+        // Guard: reject if spread is insane (>50% = 5000 bps means dead book)
+        let max_allowed_spread = (self.cfg.quote_spread_bps * 20).max(5000);
+        if real_spread_bps.unwrap_or(0) > max_allowed_spread {
+            tracing::debug!(
+                "spread too wide for load: {} bps > {} bps max",
+                real_spread_bps.unwrap_or(0),
+                max_allowed_spread
+            );
+            return Ok(quotes);
+        }
+
+        if in_load_window && skew_strength >= min_skew && effective_load_size > Decimal::ZERO {
             // Directional load: we're takers, account for taker fee
             if directional_skew > 0.0 && self.cfg.allow_buy_yes {
                 if let Some(token_id) = market.yes_token_id() {
@@ -145,10 +173,10 @@ impl ReactiveDirectional {
                         price,
                         effective_load_size,
                         format!(
-                            "directional_load YES skew={:.2} spread={}bps fees={}bps depth_mult={:.2} time_left={:?}",
+                            "directional_load YES skew={:.2} spread={}bps fees={} depth_mult={:.2} time_left={:?}",
                             directional_skew,
                             real_spread_bps.unwrap_or(0),
-                            self.fees.taker_fee_bps,
+                            self.fees.crypto_taker_fee_rate,
                             depth_multiplier,
                             time_left
                         ),
@@ -171,10 +199,10 @@ impl ReactiveDirectional {
                         price,
                         effective_load_size,
                         format!(
-                            "directional_load NO skew={:.2} spread={}bps fees={}bps depth_mult={:.2} time_left={:?}",
+                            "directional_load NO skew={:.2} spread={}bps fees={} depth_mult={:.2} time_left={:?}",
                             directional_skew,
                             real_spread_bps.unwrap_or(0),
-                            self.fees.taker_fee_bps,
+                            self.fees.crypto_taker_fee_rate,
                             depth_multiplier,
                             time_left
                         ),
@@ -184,7 +212,7 @@ impl ReactiveDirectional {
         }
 
         // Market-making quotes: suppress during strong directional load
-        if !(in_load_window && skew_strength >= self.cfg.min_skew_ratio) && effective_base_size > Decimal::ZERO {
+        if !(in_load_window && skew_strength >= min_skew) && effective_base_size > Decimal::ZERO {
             if real_spread_bps.map_or(true, |s| s < self.cfg.quote_spread_bps * 3) {
                 if self.cfg.allow_buy_yes {
                     if let Some(token_id) = market.yes_token_id() {
@@ -204,10 +232,10 @@ impl ReactiveDirectional {
                                 price,
                                 effective_base_size,
                                 format!(
-                                    "maker_quote YES bid={} mid={} spread={}bps fees={}bps depth_mult={:.2}",
+                                    "maker_quote YES bid={} mid={} spread={}bps fees={} depth_mult={:.2}",
                                     best_bid, yes_mid,
                                     real_spread_bps.unwrap_or(0),
-                                    self.fees.maker_fee_bps,
+                                    self.fees.maker_fee_rate,
                                     depth_multiplier,
                                 ),
                             ));
@@ -234,10 +262,10 @@ impl ReactiveDirectional {
                                 price,
                                 effective_base_size,
                                 format!(
-                                    "maker_quote NO bid={} mid={} spread={}bps fees={}bps depth_mult={:.2}",
+                                    "maker_quote NO bid={} mid={} spread={}bps fees={} depth_mult={:.2}",
                                     no_best_bid, no_mid,
                                     real_spread_bps.unwrap_or(0),
-                                    self.fees.maker_fee_bps,
+                                    self.fees.maker_fee_rate,
                                     depth_multiplier,
                                 ),
                             ));
@@ -252,20 +280,20 @@ impl ReactiveDirectional {
 }
 
 /// Adjusts price to account for fees and desired edge.
+/// Uses the crypto taker fee rate directly from config (e.g. 0.07 for crypto).
 fn adjust_price_for_fees(
     price: Decimal,
     is_maker: bool,
     fees: &FeesConfig,
     desired_edge_bps: i64,
 ) -> Decimal {
-    let fee_bps = if is_maker {
-        fees.maker_fee_bps
+    let fee_rate = if is_maker {
+        fees.maker_fee_rate
     } else {
-        fees.taker_fee_bps
+        fees.crypto_taker_fee_rate
     };
-    let fee_decimal = bps_to_decimal(fee_bps);
     let edge_decimal = bps_to_decimal(desired_edge_bps);
-    price - fee_decimal - edge_decimal
+    price - fee_rate - edge_decimal
 }
 
 /// Decide if we should quote as maker based on config and time left.
@@ -368,4 +396,33 @@ pub fn time_left_seconds(market: &GammaMarket) -> Option<u64> {
     } else {
         Some(0)
     }
+}
+
+/// Calculate Order Book Imbalance (-1.0 = heavy NO pressure, +1.0 = heavy YES pressure)
+pub fn calculate_orderbook_imbalance(
+    yes_bid_depth: Decimal,
+    no_bid_depth: Decimal,
+) -> Decimal {
+    let total = yes_bid_depth + no_bid_depth;
+    if total.is_zero() {
+        return dec!(0);
+    }
+    (yes_bid_depth - no_bid_depth) / total
+}
+
+/// Combined skew = momentum (60%) + imbalance (40%)
+pub fn compute_combined_skew(
+    momentum_signal: f64,
+    yes_mid: Decimal,
+    yes_bid_depth: Decimal,
+    no_bid_depth: Decimal,
+    momentum_weight: f64,
+    imbalance_weight: f64,
+) -> f64 {
+    let momentum_skew = compute_skew(momentum_signal, yes_mid);
+    let imbalance = calculate_orderbook_imbalance(yes_bid_depth, no_bid_depth);
+    let imbalance_f = imbalance.to_f64().unwrap_or(0.0);
+
+    let normalized_imbalance = imbalance_f * 2.0; // scale to ~ -2 to +2
+    (momentum_skew * momentum_weight) + (normalized_imbalance * imbalance_weight)
 }

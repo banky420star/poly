@@ -120,4 +120,47 @@ impl RiskEngine {
 
         Ok(())
     }
+
+    /// Verify preconditions for live trading. Returns an error describing
+    /// which gate failed, or Ok(()) if all clear.
+    pub fn check_live_gate(
+        &self,
+        balance: Decimal,
+        data_age_ms: u64,
+        ws_connected: bool,
+        feed_healthy: bool,
+    ) -> Result<()> {
+        if balance < self.cfg.live_min_balance_usdc {
+            bail!(
+                "live gate: balance ${} below minimum ${}",
+                balance,
+                self.cfg.live_min_balance_usdc
+            );
+        }
+        if data_age_ms > self.cfg.max_data_age_ms {
+            bail!(
+                "live gate: data age {}ms exceeds max {}ms",
+                data_age_ms,
+                self.cfg.max_data_age_ms
+            );
+        }
+        if !ws_connected {
+            bail!("live gate: WebSocket not connected");
+        }
+        if !feed_healthy {
+            bail!("live gate: price feed unhealthy");
+        }
+        Ok(())
+    }
+
+    /// Reserve for open orders: deducts the notional of resting orders
+    /// from available balance to prevent over-committing.
+    pub fn available_balance(&self, cash: Decimal, reserved: Decimal) -> Decimal {
+        let after_reserve = cash - reserved;
+        if after_reserve < self.cfg.min_cash_buffer_usdc {
+            Decimal::ZERO
+        } else {
+            after_reserve - self.cfg.min_cash_buffer_usdc
+        }
+    }
 }

@@ -4,19 +4,22 @@ dry_run_iterations = 0
 loop_interval_ms = 3000
 
 [paper]
-starting_cash_usdc = "26"
+starting_cash_usdc = "100"
 ledger_state_path = "paper_state.json"
 ledger_events_path = "paper_ledger.jsonl"
 fill_mode = "immediate"
 
 [risk]
 # Tight limits — compounding mode overrides these with equity percentages
-max_total_exposure_usdc = "13"       # 50% of bankroll max deployed
-max_market_exposure_usdc = "6"       # ~23% per market
-max_order_usdc = "5"                # CLOB minimum — smallest bet possible
-min_cash_buffer_usdc = "2"          # keep ~$2 reserve
-max_open_intents = 2                # max 2 concurrent positions
+max_total_exposure_usdc = "13"
+max_market_exposure_usdc = "6"
+max_order_usdc = "5"
+min_cash_buffer_usdc = "8"
+max_open_intents = 6
 max_daily_trades = 50
+live_min_balance_usdc = 30
+max_data_age_ms = 4000
+require_clean_build_for_live = true
 
 [ai]
 enabled = false
@@ -44,19 +47,26 @@ avoid_if_no_exit_bid = true
 maker_only = true
 
 [strategy]
-name = "reactive_directional_v1"
-min_yes_mid = "0.10"                 # avoid near-0/1 extremes
-max_yes_mid = "0.90"
-maker_edge_bps = 150                 # competitive edge for getting filled
-quote_spread_bps = 250               # only trade markets with enough spread to profit
+name = "reactive_directional_v2_imbalance"
+min_yes_mid = 0.28
+max_yes_mid = 0.72
+maker_edge_bps = 150
+quote_spread_bps = 250
 allow_buy_yes = true
 allow_buy_no = true
-directional_load_window_seconds = 90 # only load in final 90s
-min_skew_ratio = 2.0                 # require meaningful directional edge
+directional_load_window_seconds = 550          # 150s – 550s left
+min_skew_ratio = 3.2                           # was 2.0
+min_depth_usdc = 25000
 reference_feed = "binance"
-take_profit_bps = 1500               # +15% exit
-stop_loss_bps = 800                  # -8% exit
+take_profit_bps = 1500
+stop_loss_bps = 800
 min_hold_seconds = 10
+
+# NEW: Imbalance & Hybrid Signal
+use_orderbook_imbalance = true
+imbalance_weight = 0.40                        # 40% weight on imbalance
+momentum_weight = 0.60                         # 60% weight on momentum
+min_combined_skew = 2.8                        # final combined skew threshold
 
 [compound]
 enabled = true
@@ -66,9 +76,16 @@ min_cash_buffer_pct = 0.20           # 20% reserve
 base_bet_pct = 0.20                  # 20% base bet for market-making
 
 [fees]
-maker_fee_bps = 0                    # Polymarket: 0bps maker
-taker_fee_bps = 80                   # Polymarket: 80bps taker (0.8%)
+maker_fee_rate = "0.0"               # Polymarket: 0 fee for makers
+crypto_taker_fee_rate = "0.07"       # Polymarket crypto taker coefficient
 prefer_maker = true
+
+[execution]
+maker_first = true
+maker_ttl_ms = 12000
+replace_if_drift_ticks = 2
+replace_if_age_ms = 9000
+max_slippage_bps = 80
 
 [market_filter]
 limit = 15
