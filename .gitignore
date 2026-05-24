@@ -1,0 +1,17 @@
+
+# Runtime bot files
+*.jsonl
+live_dashboard.json
+ai_signal.json
+paper_state.json
+paper_ledger.jsonl
+bot_output.log
+tui_output.log
+.equity_history.log
+
+# Python cache
+__pycache__/
+*.pyc
+
+# macOS
+.DS_Store
