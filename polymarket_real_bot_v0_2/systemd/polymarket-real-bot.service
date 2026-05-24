@@ -1,0 +1,15 @@
+[Unit]
+Description=Polymarket Real Bot - paper mode
+After=network.target
+
+[Service]
+Type=simple
+User=youruser
+WorkingDirectory=/home/youruser/polymarket-real-bot
+EnvironmentFile=/home/youruser/polymarket-real-bot/.env
+ExecStart=/home/youruser/polymarket-real-bot/target/release/polymarket-real-bot run --config /home/youruser/polymarket-real-bot/config.toml --paper
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

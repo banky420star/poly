@@ -1,0 +1,79 @@
+gamma_base_url = "https://gamma-api.polymarket.com"
+clob_base_url = "https://clob.polymarket.com"
+dry_run_iterations = 0
+loop_interval_ms = 3000
+
+[paper]
+starting_cash_usdc = "26"
+ledger_state_path = "paper_state.json"
+ledger_events_path = "paper_ledger.jsonl"
+fill_mode = "immediate"
+
+[risk]
+# Tight limits — compounding mode overrides these with equity percentages
+max_total_exposure_usdc = "13"       # 50% of bankroll max deployed
+max_market_exposure_usdc = "6"       # ~23% per market
+max_order_usdc = "5"                # CLOB minimum — smallest bet possible
+min_cash_buffer_usdc = "2"          # keep ~$2 reserve
+max_open_intents = 2                # max 2 concurrent positions
+max_daily_trades = 50
+
+[ai]
+enabled = false
+signal_file = "ai_signal.json"
+min_edge = 0.04
+min_confidence = 0.65
+max_signal_age_ms = 60000
+shadow_mode = true
+
+[lstm]
+sequence_len = 60
+prediction_horizon_secs = 60
+model_path = "models/lstm_edge.pt"
+
+[ppo]
+model_path = "models/ppo_policy.zip"
+allow_live_execution = false
+
+[polymarket_ai_guardrails]
+min_seconds_to_expiry = 90
+min_spread = 0.01
+max_spread = 0.08
+min_depth_usdc = 0.0
+avoid_if_no_exit_bid = true
+maker_only = true
+
+[strategy]
+name = "reactive_directional_v1"
+min_yes_mid = "0.10"                 # avoid near-0/1 extremes
+max_yes_mid = "0.90"
+maker_edge_bps = 150                 # competitive edge for getting filled
+quote_spread_bps = 250               # only trade markets with enough spread to profit
+allow_buy_yes = true
+allow_buy_no = true
+directional_load_window_seconds = 90 # only load in final 90s
+min_skew_ratio = 2.0                 # require meaningful directional edge
+reference_feed = "binance"
+take_profit_bps = 1500               # +15% exit
+stop_loss_bps = 800                  # -8% exit
+min_hold_seconds = 10
+
+[compound]
+enabled = true
+max_order_pct = 0.50                 # 50% of equity per bet
+max_exposure_pct = 0.60              # 60% max deployed
+min_cash_buffer_pct = 0.20           # 20% reserve
+base_bet_pct = 0.20                  # 20% base bet for market-making
+
+[fees]
+maker_fee_bps = 0                    # Polymarket: 0bps maker
+taker_fee_bps = 80                   # Polymarket: 80bps taker (0.8%)
+prefer_maker = true
+
+[market_filter]
+limit = 15
+require_active = true
+require_open = true
+keywords = ["bitcoin", "btc", "ethereum", "eth", "solana", "sol", "crypto"]
+exclude_keywords = ["sports", "election", "politics", "trump", "biden", "nfl", "nba", "mlb"]
+min_depth_usdc = "5"                 # lowered for small account

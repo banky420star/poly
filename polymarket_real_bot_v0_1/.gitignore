@@ -1,0 +1,6 @@
+target/
+.env
+paper_state.json
+paper_ledger.jsonl
+*.log
+.DS_Store

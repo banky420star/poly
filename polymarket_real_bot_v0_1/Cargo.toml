@@ -1,0 +1,30 @@
+[package]
+name = "polymarket-real-bot"
+version = "0.3.0"
+edition = "2021"
+description = "Polymarket trading bot v0.3 with CLOB client, WebSocket feeds, and order signing."
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+clap = { version = "4", features = ["derive", "env"] }
+dotenvy = "0.15"
+futures-util = "0.3"
+hex = "0.4"
+hmac = "0.12"
+reqwest = { version = "0.12", features = ["json", "rustls-tls"] }
+rust_decimal = { version = "1", features = ["serde", "maths"] }
+rust_decimal_macros = "1"
+secp256k1 = { version = "0.29", features = ["recovery"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tokio = { version = "1", features = ["full"] }
+tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+url = "2"
+polymarket_client_sdk_v2 = { version = "0.5.1", features = ["clob"] }
+base64 = "0.22"

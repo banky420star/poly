@@ -1,0 +1,48 @@
+gamma_base_url = "https://gamma-api.polymarket.com"
+clob_base_url = "https://clob.polymarket.com"
+
+# 0 = run forever. For first smoke test, set to 1 or 3.
+dry_run_iterations = 3
+loop_interval_ms = 3000
+
+[paper]
+starting_cash_usdc = "10000"
+ledger_state_path = "paper_state.json"
+ledger_events_path = "paper_ledger.jsonl"
+
+# record_only: records quote intents but does not pretend they filled.
+# immediate: fills every accepted paper quote immediately for test/demo only.
+fill_mode = "record_only"
+
+[risk]
+max_total_exposure_usdc = "2000"
+max_market_exposure_usdc = "300"
+max_order_usdc = "100"
+min_cash_buffer_usdc = "150"
+max_open_intents = 80
+
+[strategy]
+name = "reactive_directional_v1"
+min_yes_mid = "0.05"
+max_yes_mid = "0.95"
+maker_edge_bps = 120
+quote_spread_bps = 250
+allow_buy_yes = true
+allow_buy_no = true
+
+# Directional loading parameters
+directional_load_window_seconds = 90
+min_skew_ratio = 2.5
+reference_feed = "binance"
+
+[fees]
+maker_fee_bps = 0
+taker_fee_bps = 80
+prefer_maker = true
+
+[market_filter]
+limit = 150
+require_active = true
+require_open = true
+keywords = ["bitcoin", "btc", "ethereum", "eth", "solana", "crypto"]
+exclude_keywords = ["sports", "election", "politics", "trump", "biden"]
