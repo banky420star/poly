@@ -15,12 +15,13 @@ CLOB_API_URL = "https://clob.polymarket.com"
 class PolymarketClient:
     """Thin async REST client for CLOB endpoints."""
 
-    def __init__(self, base_url: str = CLOB_API_URL):
+    def __init__(self, base_url: str = CLOB_API_URL, ssl_verify: bool = False):
         self.base_url = base_url
+        self.ssl_verify = ssl_verify
         self.client: httpx.AsyncClient | None = None
 
     async def start(self):
-        self.client = httpx.AsyncClient(timeout=15.0)
+        self.client = httpx.AsyncClient(timeout=15.0, verify=self.ssl_verify)
 
     async def close(self):
         if self.client:

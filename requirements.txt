@@ -9,3 +9,6 @@ pandas
 aiosqlite
 pytest
 aiosqlite
+fastapi
+uvicorn
+rich

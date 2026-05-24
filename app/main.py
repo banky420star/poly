@@ -4,6 +4,9 @@ import signal
 import sys
 from datetime import datetime, timezone
 
+import websockets
+from websockets.asyncio.server import serve
+
 from app.config import load_config
 from app.data.feature_store import FeatureStore
 from app.data.market_state import MarketState
@@ -77,6 +80,17 @@ async def run_loop(
             all_tokens.append(m.down_token_id)
         poly_ws.subscribe(all_tokens)
 
+        for m in markets:
+            recorder.write("market_discovery", {
+                "market_id": m.market_id,
+                "market": m.question,
+                "stage": "DISCOVERY",
+                "symbol": m.symbol,
+                "timeframe": m.timeframe,
+                "decision": "MARKET_FOUND",
+                "reason": [f"Current {m.timeframe} window"],
+            })
+
     if not markets:
         logger.warning("No markets discovered yet")
         return
@@ -104,8 +118,42 @@ async def run_loop(
         if features is None:
             continue
 
+        recorder.write("features", {
+            "market_id": market.market_id,
+            "stage": "FEATURES",
+            "spot": features.spot,
+            "price_to_beat": features.price_to_beat,
+            "distance_to_target": features.distance_to_target,
+            "seconds_remaining": features.seconds_remaining,
+            "decision": "FEATURES_BUILT",
+            "reason": ["Distance, velocity, volatility calculated"],
+        })
+
         prediction = probability_agent.predict(features)
+
+        recorder.write("prediction", {
+            "market_id": market.market_id,
+            "stage": "PREDICTION",
+            "prob_up": prediction.prob_up,
+            "prob_down": prediction.prob_down,
+            "confidence": prediction.confidence,
+            "decision": "PREDICTION_READY",
+            "reason": [f"prob_up={prediction.prob_up:.3f} conf={prediction.confidence:.3f}"],
+        })
+
         odds = odds_agent.calculate(features, prediction)
+
+        recorder.write("odds", {
+            "market_id": market.market_id,
+            "stage": "ODDS",
+            "best_side": odds.best_side,
+            "market_ask": odds.market_ask,
+            "adjusted_edge": odds.adjusted_edge,
+            "max_entry_price": odds.max_entry_price,
+            "decision": "ODDS_CALCULATED",
+            "reason": [f"Best side is {odds.best_side}"],
+        })
+
         decision = entry_agent.decide(features, prediction, odds)
 
         payload = {
@@ -119,6 +167,7 @@ async def run_loop(
             "confidence": prediction.confidence,
             "best_side": odds.best_side,
             "adjusted_edge": odds.adjusted_edge,
+            "stage": "ENTRY",
             "decision": decision.action,
             "reason": decision.reason,
         }
@@ -141,6 +190,19 @@ async def run_loop(
             if result["status"] == "PAPER_FILLED":
                 logger.info("ENTRY: %s %s @ %.4f $%.2f",
                            market.symbol, decision.side, decision.limit_price, result["size_usd"])
+
+                position = positions.get(market.market_id)
+                if position:
+                    recorder.write("position", {
+                        "market_id": market.market_id,
+                        "market": market.question,
+                        "stage": "POSITION",
+                        "position_side": position.side,
+                        "avg_entry": position.avg_entry,
+                        "shares": position.shares,
+                        "decision": "IN_POSITION",
+                        "reason": ["Paper position opened"],
+                    })
 
     # 5. Check exits for open positions
     for market_id, position in list(positions.positions.items()):
@@ -189,6 +251,8 @@ async def run():
     cfg = load_config()
     logger = setup_logger()
 
+    ssl_verify = cfg.raw.get("ssl_verify", False)
+
     # Initialize components
     feature_store = FeatureStore()
     probability_agent = ProbabilityAgent()
@@ -203,10 +267,28 @@ async def run():
     )
     recorder = Recorder()
 
+    # TUI WebSocket server — broadcasts events to connected dashboards
+    tui_clients: set = set()
+
+    async def handle_tui(ws):
+        tui_clients.add(ws)
+        try:
+            async for _ in ws:
+                pass  # keep-alive, no client→server messages
+        finally:
+            tui_clients.discard(ws)
+
+    recorder.attach_ws(tui_clients)
+    tui_server = await serve(handle_tui, "localhost", 9876)
+    logger.info("TUI WebSocket server on ws://localhost:9876")
+
     # Initialize clients
-    binance_feed = BinancePriceFeed(symbols=cfg.raw.get("symbols", ["BTC", "ETH", "SOL"]))
-    poly_ws = PolymarketWsClient()
-    poly_rest = PolymarketClient()
+    binance_feed = BinancePriceFeed(
+        symbols=cfg.raw.get("symbols", ["BTC", "ETH", "SOL"]),
+        ssl_verify=ssl_verify,
+    )
+    poly_ws = PolymarketWsClient(ssl_verify=ssl_verify)
+    poly_rest = PolymarketClient(ssl_verify=ssl_verify)
     discovery = MarketDiscovery(
         symbols=cfg.raw.get("symbols", ["BTC", "ETH", "SOL"]),
         timeframes=cfg.raw.get("markets", {}).get("timeframes", ["5m", "15m"]),
@@ -215,7 +297,7 @@ async def run():
     http_client = None
     try:
         import httpx
-        http_client = httpx.AsyncClient(timeout=30.0)
+        http_client = httpx.AsyncClient(timeout=30.0, verify=ssl_verify)
 
         # Start data feeds
         await binance_feed.start()
@@ -258,6 +340,8 @@ async def run():
 
     finally:
         logger.info("Shutting down...")
+        tui_server.close()
+        await tui_server.wait_closed()
         await binance_feed.stop()
         await poly_ws.stop()
         await poly_rest.close()

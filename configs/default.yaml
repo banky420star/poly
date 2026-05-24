@@ -38,3 +38,5 @@ execution:
 logging:
   level: INFO
   json_logs: true
+
+ssl_verify: false

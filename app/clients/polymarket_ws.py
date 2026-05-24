@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import ssl
 from typing import Optional
 
 import websockets
@@ -16,7 +17,8 @@ POLY_WS_URL = "wss://ws-subscriptions-clob.polymarket.com/ws/market"
 class PolymarketWsClient:
     """Connects to Polymarket WebSocket and maintains live order book snapshots."""
 
-    def __init__(self):
+    def __init__(self, ssl_verify: bool = False):
+        self.ssl_verify = ssl_verify
         self.books: dict[str, OrderBookState] = {}
         self.token_ids: list[str] = []
         self.running = False
@@ -38,9 +40,15 @@ class PolymarketWsClient:
         logger.info("Polymarket WS started with %d tokens", len(self.token_ids))
 
     async def _run(self):
+        if self.ssl_verify:
+            ssl_context = None
+        else:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
         while self.running:
             try:
-                async with websockets.connect(POLY_WS_URL) as ws:
+                async with websockets.connect(POLY_WS_URL, ssl=ssl_context) as ws:
                     self.connected = True
                     logger.info("Polymarket WS connected")
 

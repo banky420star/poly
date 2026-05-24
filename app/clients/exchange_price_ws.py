@@ -2,6 +2,7 @@
 import asyncio
 import json
 import logging
+import ssl
 from datetime import datetime, timezone
 
 import websockets
@@ -16,8 +17,9 @@ BINANCE_WS_URL = "wss://stream.binance.com:9443/ws"
 class BinancePriceFeed:
     """Connects to Binance WebSocket and maintains live spot prices."""
 
-    def __init__(self, symbols: list[str] | None = None):
+    def __init__(self, symbols: list[str] | None = None, ssl_verify: bool = False):
         self.symbols = symbols or ["BTC", "ETH", "SOL"]
+        self.ssl_verify = ssl_verify
         self.prices: dict[str, PriceState] = {}
         self.running = False
         self._task: asyncio.Task | None = None
@@ -35,9 +37,15 @@ class BinancePriceFeed:
 
     async def _run(self):
         url = f"{BINANCE_WS_URL}/{self._stream_name()}"
+        if self.ssl_verify:
+            ssl_context = None
+        else:
+            ssl_context = ssl.create_default_context()
+            ssl_context.check_hostname = False
+            ssl_context.verify_mode = ssl.CERT_NONE
         while self.running:
             try:
-                async with websockets.connect(url) as ws:
+                async with websockets.connect(url, ssl=ssl_context) as ws:
                     logger.info("Binance WS connected")
                     async for message in ws:
                         if not self.running:
